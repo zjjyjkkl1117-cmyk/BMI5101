@@ -1,0 +1,100 @@
+-- ============================================================
+-- BMI5101group_project | 06_outcome_and_analysis_table.sql   (v2)
+-- Outcomes + the modelling table.
+-- ============================================================
+
+-- ---------- Outcomes ----------------------------------------
+CREATE OR REPLACE TABLE `BMI5101group_project.outcomes` AS
+SELECT
+  c.first_stay_id,
+  c.hospital_expire_flag AS died_in_hospital,            -- primary
+  IF(c.deathtime IS NOT NULL
+     AND c.deathtime <= DATETIME_ADD(c.intime, INTERVAL 28 DAY), 1, 0) AS died_28d,
+  IF(c.deathtime IS NOT NULL AND c.deathtime <= c.outtime, 1, 0)       AS died_in_icu,
+  GREATEST(c.hospital_expire_flag, c.discharged_to_hospice)            AS died_or_hospice
+FROM `BMI5101group_project.cohort` c;
+
+-- ---------- Wide labs ----------------------------------------
+CREATE OR REPLACE TABLE `BMI5101group_project.labs_wide` AS
+SELECT * FROM (
+  SELECT first_stay_id, feature, val_min, val_max, val_mean, val_last, val_slope_per_hour
+  FROM `BMI5101group_project.labs_features`
+)
+PIVOT (
+  MAX(val_min) AS min, MAX(val_max) AS max, MAX(val_mean) AS mean,
+  MAX(val_last) AS last, MAX(val_slope_per_hour) AS slope
+  FOR feature IN ('wbc','hemoglobin','platelet','sodium','potassium','chloride',
+                  'bicarbonate','anion_gap','bun','creatinine','glucose','lactate',
+                  'albumin','bilirubin_total','pt','inr','ptt','ph','rdw','mcv')
+);
+
+-- ---------- Wide vitals --------------------------------------
+CREATE OR REPLACE TABLE `BMI5101group_project.vitals_wide` AS
+SELECT * FROM (
+  SELECT first_stay_id, feature, val_min, val_max, val_mean, val_sd,
+         val_last, val_slope_per_hour, val_mean_h0_8, val_mean_h16_24
+  FROM `BMI5101group_project.vitals_features`
+)
+PIVOT (
+  MAX(val_min) AS min, MAX(val_max) AS max, MAX(val_mean) AS mean,
+  MAX(val_sd) AS sd, MAX(val_last) AS last, MAX(val_slope_per_hour) AS slope,
+  MAX(val_mean_h0_8) AS early, MAX(val_mean_h16_24) AS late
+  FOR feature IN ('heart_rate','sbp','dbp','map','resp_rate','spo2','temp_c')
+);
+
+-- ---------- The analysis table -------------------------------
+-- Columns deliberately listed, never SELECT * FROM cohort: that table
+-- holds outtime, dischtime, deathtime and hospital_expire_flag.
+CREATE OR REPLACE TABLE `BMI5101group_project.analysis_table` AS
+SELECT
+  c.first_stay_id,
+  c.subject_id,                       -- for patient-level splits only
+  c.hadm_id,
+  -- known at t0
+  c.age_at_admission,
+  IF(c.gender = 'F', 1, 0) AS female,
+  c.admission_type,
+  c.admission_location,
+  c.first_careunit,
+  c.cmo_before_t0,
+  c.dnr_before_t0,
+  -- features
+  pc.*   EXCEPT (first_stay_id),
+  vf.*   EXCEPT (first_stay_id),
+  sf.*   EXCEPT (first_stay_id),
+  vent.* EXCEPT (first_stay_id),
+  onc.*  EXCEPT (first_stay_id),
+  g.gcs_total_min,
+  lw.*   EXCEPT (first_stay_id),
+  vw.*   EXCEPT (first_stay_id),
+  -- outcomes last
+  o.died_in_hospital,
+  o.died_28d,
+  o.died_in_icu,
+  o.died_or_hospice
+FROM `BMI5101group_project.cohort` c
+LEFT JOIN `BMI5101group_project.prior_comorbidities`  pc   USING (first_stay_id)
+LEFT JOIN `BMI5101group_project.vaso_features`        vf   USING (first_stay_id)
+LEFT JOIN `BMI5101group_project.sedation_features`    sf   USING (first_stay_id)
+LEFT JOIN `BMI5101group_project.ventilation_features` vent USING (first_stay_id)
+LEFT JOIN `BMI5101group_project.onc_drug_features`    onc  USING (first_stay_id)
+LEFT JOIN `BMI5101group_project.gcs_min`              g    USING (first_stay_id)
+LEFT JOIN `BMI5101group_project.labs_wide`            lw   USING (first_stay_id)
+LEFT JOIN `BMI5101group_project.vitals_wide`          vw   USING (first_stay_id)
+LEFT JOIN `BMI5101group_project.outcomes`             o    USING (first_stay_id);
+
+
+-- ---------- Table 1 starter ----------------------------------
+SELECT
+  died_in_hospital,
+  COUNT(*)                                 AS n,
+  ROUND(AVG(age_at_admission), 1)          AS age_mean,
+  ROUND(AVG(female) * 100, 1)              AS pct_female,
+  ROUND(AVG(on_norepinephrine) * 100, 1)   AS pct_norepinephrine,
+  ROUND(AVG(invasive_vent_by_t0) * 100, 1) AS pct_invasive_vent,
+  ROUND(AVG(cmo_before_t0) * 100, 1)       AS pct_cmo_before_t0,
+  ROUND(AVG(gcs_total_min), 1)             AS gcs_min_mean,
+  ROUND(AVG(mean_bun), 1)                  AS bun_mean,
+  ROUND(AVG(max_lactate), 2)               AS lactate_max_mean
+FROM `BMI5101group_project.analysis_table`
+GROUP BY died_in_hospital;
