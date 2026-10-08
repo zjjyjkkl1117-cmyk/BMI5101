@@ -1,0 +1,76 @@
+-- ============================================================
+-- BMI5101group_project | 03_vitals_first24h.sql   (v2 - episode-aware)
+-- Vitals and GCS from chartevents in [intime, t0].
+-- ============================================================
+-- KEY CHANGE: an episode can span several stay_ids (ICU transfers),
+-- so the join uses  ce.stay_id IN UNNEST(c.stay_ids).
+
+CREATE OR REPLACE TABLE `BMI5101group_project.vitals_long` AS
+WITH item_map AS (
+  SELECT * FROM UNNEST([
+    STRUCT(220045 AS itemid, 'heart_rate'   AS feature),
+    STRUCT(220050, 'sbp'), STRUCT(220179, 'sbp'),
+    STRUCT(220051, 'dbp'), STRUCT(220180, 'dbp'),
+    STRUCT(220052, 'map'), STRUCT(220181, 'map'), STRUCT(225312, 'map'),
+    STRUCT(220210, 'resp_rate'), STRUCT(224690, 'resp_rate'),
+    STRUCT(220277, 'spo2'),
+    STRUCT(223762, 'temp_c'), STRUCT(223761, 'temp_f'),
+    STRUCT(220739, 'gcs_eye'), STRUCT(223900, 'gcs_verbal'), STRUCT(223901, 'gcs_motor'),
+    STRUCT(226512, 'weight_kg'), STRUCT(220621, 'glucose_fingerstick')
+  ])
+),
+raw AS (
+  SELECT
+    c.first_stay_id,
+    CASE WHEN m.feature = 'temp_f' THEN (ce.valuenum - 32) * 5/9
+         ELSE ce.valuenum END AS valuenum,
+    CASE WHEN m.feature = 'temp_f' THEN 'temp_c' ELSE m.feature END AS feature_final,
+    DATETIME_DIFF(ce.charttime, c.intime, MINUTE) / 60.0 AS hours_since_intime
+  FROM `BMI5101group_project.cohort` c
+  JOIN `physionet-data.mimiciv_3_1_icu.chartevents` ce
+    ON  ce.stay_id IN UNNEST(c.stay_ids)      -- <-- episode-aware join
+    AND ce.charttime >= c.intime
+    AND ce.charttime <= c.t0                  -- <-- the leakage guard
+  JOIN item_map m ON m.itemid = ce.itemid
+  WHERE ce.valuenum IS NOT NULL
+)
+SELECT first_stay_id, feature_final AS feature, valuenum, hours_since_intime
+FROM raw
+WHERE NOT (feature_final = 'heart_rate' AND (valuenum < 25  OR valuenum > 225))
+  AND NOT (feature_final = 'spo2'       AND (valuenum < 50  OR valuenum > 100))
+  AND NOT (feature_final = 'resp_rate'  AND (valuenum < 5   OR valuenum > 60))
+  AND NOT (feature_final IN ('sbp','dbp','map') AND (valuenum < 10 OR valuenum > 300))
+  AND NOT (feature_final = 'temp_c'     AND (valuenum < 25  OR valuenum > 45));
+
+CREATE OR REPLACE TABLE `BMI5101group_project.vitals_features` AS
+SELECT
+  first_stay_id,
+  feature,
+  COUNT(*)              AS n_measurements,
+  MIN(valuenum)         AS val_min,
+  MAX(valuenum)         AS val_max,
+  AVG(valuenum)         AS val_mean,
+  STDDEV_SAMP(valuenum) AS val_sd,
+  MAX(valuenum) - MIN(valuenum) AS val_range,
+  ARRAY_AGG(valuenum ORDER BY hours_since_intime ASC  LIMIT 1)[OFFSET(0)] AS val_first,
+  ARRAY_AGG(valuenum ORDER BY hours_since_intime DESC LIMIT 1)[OFFSET(0)] AS val_last,
+  SAFE_DIVIDE(
+    COVAR_POP(valuenum, hours_since_intime),
+    NULLIF(VAR_POP(hours_since_intime), 0)
+  ) AS val_slope_per_hour,
+  AVG(IF(hours_since_intime <  8, valuenum, NULL))  AS val_mean_h0_8,
+  AVG(IF(hours_since_intime >= 16, valuenum, NULL)) AS val_mean_h16_24
+FROM `BMI5101group_project.vitals_long`
+GROUP BY first_stay_id, feature;
+
+-- GCS total (trust rows where n_components = 3)
+CREATE OR REPLACE TABLE `BMI5101group_project.gcs_min` AS
+WITH per_component AS (
+  SELECT first_stay_id, feature, MIN(valuenum) AS min_val
+  FROM `BMI5101group_project.vitals_long`
+  WHERE feature IN ('gcs_eye','gcs_verbal','gcs_motor')
+  GROUP BY first_stay_id, feature
+)
+SELECT first_stay_id, SUM(min_val) AS gcs_total_min, COUNT(*) AS n_components
+FROM per_component
+GROUP BY first_stay_id;
