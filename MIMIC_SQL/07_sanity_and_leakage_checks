@@ -1,0 +1,74 @@
+-- ============================================================
+-- BMI5101group_project | 07_sanity_and_leakage_checks.sql   (v2)
+-- Run before anyone trains a model.
+-- ============================================================
+
+-- 1. Any feature row after t0? Must be 0.
+SELECT 'labs' AS src, COUNTIF(hours_since_intime > 24) AS n_after_t0
+FROM `BMI5101group_project.labs_long`
+UNION ALL
+SELECT 'vitals', COUNTIF(hours_since_intime > 24)
+FROM `BMI5101group_project.vitals_long`;
+
+-- 2. Anyone who died before t0? Must be 0.
+SELECT COUNTIF(deathtime IS NOT NULL AND deathtime <= t0) AS died_before_t0
+FROM `BMI5101group_project.cohort`;
+
+-- 3. One row per episode, one episode per patient. Both must be 0.
+SELECT COUNT(*) AS dup_rows FROM (
+  SELECT first_stay_id FROM `BMI5101group_project.analysis_table`
+  GROUP BY first_stay_id HAVING COUNT(*) > 1);
+SELECT COUNT(*) AS patients_with_multiple_rows FROM (
+  SELECT subject_id FROM `BMI5101group_project.analysis_table`
+  GROUP BY subject_id HAVING COUNT(*) > 1);
+
+-- 4. No leaky column reached the analysis table. Must return 0 rows.
+SELECT column_name
+FROM `BMI5101group_project.INFORMATION_SCHEMA.COLUMNS`
+WHERE table_name = 'analysis_table'
+  AND REGEXP_CONTAINS(LOWER(column_name),
+      r'outtime|dischtime|deathtime|los|expire_flag|charlson|vent_duration|discharge_location');
+
+-- 5. Missingness per column (edit the list; this is the pattern).
+SELECT
+  COUNT(*) AS n,
+  ROUND(100 * COUNTIF(max_lactate   IS NULL) / COUNT(*), 1) AS pct_missing_lactate,
+  ROUND(100 * COUNTIF(mean_albumin  IS NULL) / COUNT(*), 1) AS pct_missing_albumin,
+  ROUND(100 * COUNTIF(mean_bun      IS NULL) / COUNT(*), 1) AS pct_missing_bun,
+  ROUND(100 * COUNTIF(gcs_total_min IS NULL) / COUNT(*), 1) AS pct_missing_gcs,
+  ROUND(100 * COUNTIF(mean_spo2     IS NULL) / COUNT(*), 1) AS pct_missing_spo2
+FROM `BMI5101group_project.analysis_table`;
+
+-- 6. Outcome prevalence under each definition.
+SELECT
+  COUNT(*) AS n,
+  ROUND(AVG(died_in_hospital) * 100, 1) AS pct_in_hospital,
+  ROUND(AVG(died_or_hospice)  * 100, 1) AS pct_incl_hospice,
+  ROUND(AVG(died_28d)         * 100, 1) AS pct_28d
+FROM `BMI5101group_project.analysis_table`;
+
+-- 7. Univariate screen - a suspiciously strong feature means leakage.
+SELECT 'mean_bun' AS feature,
+  ROUND(AVG(IF(died_in_hospital = 1, mean_bun, NULL)), 2) AS mean_died,
+  ROUND(AVG(IF(died_in_hospital = 0, mean_bun, NULL)), 2) AS mean_survived
+FROM `BMI5101group_project.analysis_table`
+UNION ALL SELECT 'max_lactate',
+  ROUND(AVG(IF(died_in_hospital = 1, max_lactate, NULL)), 2),
+  ROUND(AVG(IF(died_in_hospital = 0, max_lactate, NULL)), 2)
+FROM `BMI5101group_project.analysis_table`
+UNION ALL SELECT 'gcs_total_min',
+  ROUND(AVG(IF(died_in_hospital = 1, gcs_total_min, NULL)), 2),
+  ROUND(AVG(IF(died_in_hospital = 0, gcs_total_min, NULL)), 2)
+FROM `BMI5101group_project.analysis_table`;
+
+-- 8. Why LOS was leaky in the reference paper.
+SELECT ROUND(CORR(DATETIME_DIFF(outtime, intime, HOUR) / 24.0,
+                  CAST(hospital_expire_flag AS FLOAT64)), 3) AS corr_los_death
+FROM `BMI5101group_project.cohort`;
+
+-- 9. Row counts across all tables.
+SELECT 'cohort' AS t, COUNT(*) AS n FROM `BMI5101group_project.cohort`
+UNION ALL SELECT 'analysis_table',  COUNT(*) FROM `BMI5101group_project.analysis_table`
+UNION ALL SELECT 'labs_features',   COUNT(DISTINCT first_stay_id) FROM `BMI5101group_project.labs_features`
+UNION ALL SELECT 'vitals_features', COUNT(DISTINCT first_stay_id) FROM `BMI5101group_project.vitals_features`
+ORDER BY t;
