@@ -1,0 +1,82 @@
+-- ============================================================
+-- BMI5101group_project | 02_labs_first24h.sql   (v2 - keyed on first_stay_id)
+-- Laboratory features measured in [intime, t0]. LONG format.
+-- Run 01_cohort_v2.sql first.
+-- ============================================================
+-- labevents joins on subject_id, so episode merging does not affect
+-- the join - only the key column name changed.
+
+CREATE OR REPLACE TABLE `BMI5101group_project.labs_long` AS
+WITH lab_map AS (
+  SELECT * FROM UNNEST([
+    STRUCT(50862 AS itemid, 'albumin'      AS feature),
+    STRUCT(50868, 'anion_gap'),
+    STRUCT(50882, 'bicarbonate'),
+    STRUCT(50885, 'bilirubin_total'),
+    STRUCT(50893, 'calcium_total'),
+    STRUCT(50902, 'chloride'),
+    STRUCT(50912, 'creatinine'),
+    STRUCT(50931, 'glucose'),
+    STRUCT(50960, 'magnesium'),
+    STRUCT(50970, 'phosphate'),
+    STRUCT(50971, 'potassium'),
+    STRUCT(50983, 'sodium'),
+    STRUCT(51006, 'bun'),
+    STRUCT(50813, 'lactate'),
+    STRUCT(50820, 'ph'),
+    STRUCT(51221, 'hematocrit'),
+    STRUCT(51222, 'hemoglobin'),
+    STRUCT(51237, 'inr'),
+    STRUCT(51248, 'mch'),
+    STRUCT(51249, 'mchc'),
+    STRUCT(51250, 'mcv'),
+    STRUCT(51265, 'platelet'),
+    STRUCT(51274, 'pt'),
+    STRUCT(51275, 'ptt'),
+    STRUCT(51277, 'rdw'),
+    STRUCT(51279, 'rbc'),
+    STRUCT(51301, 'wbc')
+  ])
+)
+SELECT
+  c.first_stay_id,
+  m.feature,
+  le.valuenum,
+  DATETIME_DIFF(le.charttime, c.intime, MINUTE) / 60.0 AS hours_since_intime
+FROM `BMI5101group_project.cohort` c
+JOIN `physionet-data.mimiciv_3_1_hosp.labevents` le
+  ON  le.subject_id = c.subject_id
+  AND le.charttime >= c.intime
+  AND le.charttime <= c.t0                 -- <-- the leakage guard
+JOIN lab_map m
+  ON m.itemid = le.itemid
+WHERE le.valuenum IS NOT NULL;
+
+CREATE OR REPLACE TABLE `BMI5101group_project.labs_features` AS
+SELECT
+  first_stay_id,
+  feature,
+  COUNT(*)              AS n_measurements,
+  MIN(valuenum)         AS val_min,
+  MAX(valuenum)         AS val_max,
+  AVG(valuenum)         AS val_mean,
+  STDDEV_SAMP(valuenum) AS val_sd,
+  ARRAY_AGG(valuenum ORDER BY hours_since_intime ASC  LIMIT 1)[OFFSET(0)] AS val_first,
+  ARRAY_AGG(valuenum ORDER BY hours_since_intime DESC LIMIT 1)[OFFSET(0)] AS val_last,
+  SAFE_DIVIDE(
+    COVAR_POP(valuenum, hours_since_intime),
+    NULLIF(VAR_POP(hours_since_intime), 0)
+  ) AS val_slope_per_hour
+FROM `BMI5101group_project.labs_long`
+GROUP BY first_stay_id, feature;
+
+-- Coverage check: do NOT drop poorly covered features automatically -
+-- missingness is informative. Use it to decide indicator vs drop.
+SELECT
+  feature,
+  COUNT(DISTINCT first_stay_id) AS n_stays_with_value,
+  ROUND(100 * COUNT(DISTINCT first_stay_id) /
+        (SELECT COUNT(*) FROM `BMI5101group_project.cohort`), 1) AS pct_coverage
+FROM `BMI5101group_project.labs_features`
+GROUP BY feature
+ORDER BY pct_coverage DESC;
