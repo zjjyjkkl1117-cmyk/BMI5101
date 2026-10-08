@@ -1,0 +1,85 @@
+-- ============================================================
+-- BMI5101group_project | 08_sensitivity_analyses.sql
+-- Four analyses that pre-empt the hardest Q&A questions.
+-- ============================================================
+
+-- ---------- A. Outcome: hospice discharge counted as event ---
+-- In lung cancer, hospice discharge means expected death but is coded
+-- as a survivor by hospital_expire_flag.
+CREATE OR REPLACE TABLE `BMI5101group_project.outcomes_sensitivity` AS
+SELECT
+  first_stay_id,
+  hospital_expire_flag                                        AS died_primary,
+  GREATEST(hospital_expire_flag, discharged_to_hospice)       AS died_or_hospice,
+  IF(deathtime IS NOT NULL
+     AND deathtime <= DATETIME_ADD(intime, INTERVAL 28 DAY), 1, 0) AS died_28d
+FROM `BMI5101group_project.cohort`;
+
+SELECT
+  COUNT(*)                                  AS n,
+  ROUND(AVG(died_primary) * 100, 1)         AS pct_primary,
+  ROUND(AVG(died_or_hospice) * 100, 1)      AS pct_incl_hospice,
+  ROUND(AVG(died_28d) * 100, 1)             AS pct_28d
+FROM `BMI5101group_project.outcomes_sensitivity`;
+
+-- ---------- B. Cohort excluding CMO before t0 ----------------
+-- Train and evaluate on this subset; report alongside the main model.
+CREATE OR REPLACE TABLE `BMI5101group_project.cohort_no_cmo` AS
+SELECT * FROM `BMI5101group_project.cohort`
+WHERE cmo_before_t0 = 0;
+
+-- ---------- C. Strict availability: storetime <= t0 ----------
+-- charttime = when the sample was taken; storetime = when the result
+-- was available. A true real-time model only sees resulted values.
+CREATE OR REPLACE TABLE `BMI5101group_project.labs_long_strict` AS
+WITH lab_map AS (
+  SELECT * FROM UNNEST([
+    STRUCT(50862 AS itemid, 'albumin' AS feature), STRUCT(50868, 'anion_gap'),
+    STRUCT(50882, 'bicarbonate'), STRUCT(50912, 'creatinine'),
+    STRUCT(50931, 'glucose'), STRUCT(50971, 'potassium'),
+    STRUCT(50983, 'sodium'), STRUCT(51006, 'bun'),
+    STRUCT(50813, 'lactate'), STRUCT(51222, 'hemoglobin'),
+    STRUCT(51265, 'platelet'), STRUCT(51301, 'wbc'),
+    STRUCT(51237, 'inr'), STRUCT(51274, 'pt')
+  ])
+)
+SELECT
+  c.first_stay_id,
+  m.feature,
+  le.valuenum,
+  DATETIME_DIFF(le.charttime, c.intime, MINUTE) / 60.0 AS hours_since_intime
+FROM `BMI5101group_project.cohort` c
+JOIN `physionet-data.mimiciv_3_1_hosp.labevents` le
+  ON  le.subject_id = c.subject_id
+  AND le.charttime >= c.intime
+  AND le.charttime <= c.t0
+  AND (le.storetime IS NULL OR le.storetime <= c.t0)   -- the strict guard
+JOIN lab_map m ON m.itemid = le.itemid
+WHERE le.valuenum IS NOT NULL;
+
+-- How much data does the strict rule cost?
+SELECT
+  (SELECT COUNT(*) FROM `BMI5101group_project.labs_long`)        AS n_charttime_rule,
+  (SELECT COUNT(*) FROM `BMI5101group_project.labs_long_strict`) AS n_storetime_rule;
+
+-- ---------- D. The leaky comparison (upper bound only) -------
+-- Quantifies how much AUROC the reference paper's leakage was buying.
+-- Label every figure from this model clearly as NOT deployable.
+CREATE OR REPLACE TABLE `BMI5101group_project.leaky_features` AS
+SELECT
+  c.first_stay_id,
+  DATETIME_DIFF(c.outtime, c.intime, HOUR) / 24.0 AS icu_los_days,       -- leaky
+  DATETIME_DIFF(c.dischtime, c.admittime, HOUR) / 24.0 AS hosp_los_days, -- leaky
+  ch.charlson_comorbidity_index,                                          -- leaky
+  v.total_vent_hours                                                      -- leaky
+FROM `BMI5101group_project.cohort` c
+LEFT JOIN `physionet-data.mimiciv_3_1_derived.charlson` ch USING (hadm_id)
+LEFT JOIN (
+  SELECT stay_id,
+         SUM(DATETIME_DIFF(endtime, starttime, MINUTE)) / 60.0 AS total_vent_hours
+  FROM `physionet-data.mimiciv_3_1_derived.ventilation`
+  GROUP BY stay_id
+) v ON v.stay_id = c.first_stay_id;
+
+-- Expected finding, and a strong slide: adding these lifts AUROC
+-- substantially while making the model useless at hour 24.
