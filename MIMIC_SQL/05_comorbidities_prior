@@ -1,0 +1,86 @@
+-- ============================================================
+-- BMI5101group_project | 05_comorbidities_prior.sql   (v2 - keyed on first_stay_id)
+-- Comorbidity burden built ONLY from earlier hospital admissions.
+-- ============================================================
+-- This is the leakage-safe replacement for the reference paper's
+-- ICD embeddings. Current-admission codes are assigned at discharge
+-- and can describe complications that happened on ICU day 6.
+-- Codes from an admission that ENDED before this one began were
+-- knowable at t0.
+--
+-- Trade-off to state openly in your limitations slide: patients with
+-- no prior admission at this hospital look comorbidity-free. The
+-- has_prior_admission flag below lets the model learn that difference
+-- instead of silently treating "unknown" as "healthy".
+
+CREATE OR REPLACE TABLE `BMI5101group_project.prior_comorbidities` AS
+WITH prior_adm AS (
+  SELECT
+    c.first_stay_id,
+    a_prev.hadm_id AS prior_hadm_id
+  FROM `BMI5101group_project.cohort` c
+  JOIN `physionet-data.mimiciv_3_1_hosp.admissions` a_prev
+    ON  a_prev.subject_id = c.subject_id
+    AND a_prev.dischtime  < c.admittime        -- strictly earlier, completed
+),
+
+prior_dx AS (
+  SELECT
+    p.first_stay_id,
+    d.icd_code,
+    d.icd_version
+  FROM prior_adm p
+  JOIN `physionet-data.mimiciv_3_1_hosp.diagnoses_icd` d
+    ON d.hadm_id = p.prior_hadm_id
+),
+
+flags AS (
+  SELECT
+    first_stay_id,
+    MAX(IF((icd_version = 9  AND REGEXP_CONTAINS(icd_code, r'^(428)')) OR
+           (icd_version = 10 AND REGEXP_CONTAINS(icd_code, r'^(I50)')), 1, 0)) AS chf,
+    MAX(IF((icd_version = 9  AND REGEXP_CONTAINS(icd_code, r'^(49[0-6]|500|501|502|503|504|505)')) OR
+           (icd_version = 10 AND REGEXP_CONTAINS(icd_code, r'^(J4[0-7]|J6[0-7])')), 1, 0)) AS copd,
+    MAX(IF((icd_version = 9  AND REGEXP_CONTAINS(icd_code, r'^(585)')) OR
+           (icd_version = 10 AND REGEXP_CONTAINS(icd_code, r'^(N18)')), 1, 0)) AS ckd,
+    MAX(IF((icd_version = 9  AND REGEXP_CONTAINS(icd_code, r'^(250)')) OR
+           (icd_version = 10 AND REGEXP_CONTAINS(icd_code, r'^(E1[01234])')), 1, 0)) AS diabetes,
+    MAX(IF((icd_version = 9  AND REGEXP_CONTAINS(icd_code, r'^(571[2456])')) OR
+           (icd_version = 10 AND REGEXP_CONTAINS(icd_code, r'^(K70[23]|K71[7]|K7[234])')), 1, 0)) AS liver_disease,
+    MAX(IF((icd_version = 9  AND REGEXP_CONTAINS(icd_code, r'^(41[01234])')) OR
+           (icd_version = 10 AND REGEXP_CONTAINS(icd_code, r'^(I2[0-5])')), 1, 0)) AS ischemic_heart,
+    MAX(IF((icd_version = 9  AND REGEXP_CONTAINS(icd_code, r'^(19[6-9])')) OR
+           (icd_version = 10 AND REGEXP_CONTAINS(icd_code, r'^(C7[7-9]|C80)')), 1, 0)) AS metastatic_disease,
+    COUNT(DISTINCT icd_code) AS n_distinct_prior_codes
+  FROM prior_dx
+  GROUP BY first_stay_id
+),
+
+prior_counts AS (
+  SELECT
+    c.first_stay_id,
+    COUNT(DISTINCT p.prior_hadm_id) AS n_prior_admissions,
+    -- prior healthcare utilisation: days since the last discharge
+    DATETIME_DIFF(c.admittime, MAX(a.dischtime), DAY) AS days_since_last_discharge
+  FROM `BMI5101group_project.cohort` c
+  LEFT JOIN prior_adm p USING (first_stay_id)
+  LEFT JOIN `physionet-data.mimiciv_3_1_hosp.admissions` a ON a.hadm_id = p.prior_hadm_id
+  GROUP BY c.first_stay_id, c.admittime
+)
+
+SELECT
+  c.first_stay_id,
+  IF(pc.n_prior_admissions > 0, 1, 0)             AS has_prior_admission,
+  COALESCE(pc.n_prior_admissions, 0)              AS n_prior_admissions,
+  pc.days_since_last_discharge,
+  COALESCE(f.chf, 0)                AS prior_chf,
+  COALESCE(f.copd, 0)               AS prior_copd,
+  COALESCE(f.ckd, 0)                AS prior_ckd,
+  COALESCE(f.diabetes, 0)           AS prior_diabetes,
+  COALESCE(f.liver_disease, 0)      AS prior_liver_disease,
+  COALESCE(f.ischemic_heart, 0)     AS prior_ischemic_heart,
+  COALESCE(f.metastatic_disease, 0) AS prior_metastatic_disease,
+  COALESCE(f.n_distinct_prior_codes, 0) AS n_distinct_prior_codes
+FROM `BMI5101group_project.cohort` c
+LEFT JOIN prior_counts pc USING (first_stay_id)
+LEFT JOIN flags f        USING (first_stay_id);
