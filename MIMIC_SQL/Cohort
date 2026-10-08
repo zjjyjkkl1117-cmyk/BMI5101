@@ -1,0 +1,115 @@
+CREATE SCHEMA IF NOT EXISTS `BMI5101group_project` OPTIONS (location = 'US');
+
+-- ---------- Step 1: episodes, not raw stay_ids ---------------
+CREATE OR REPLACE TABLE `BMI5101group_project.episodes` AS
+WITH lung_ca_adm AS (
+  SELECT DISTINCT hadm_id
+  FROM `physionet-data.mimiciv_3_1_hosp.diagnoses_icd`
+  WHERE (icd_version = 9  AND icd_code LIKE '162%')
+     OR (icd_version = 10 AND icd_code LIKE 'C34%')
+),
+stays AS (
+  SELECT
+    icu.subject_id, icu.hadm_id, icu.stay_id,
+    icu.first_careunit, icu.intime, icu.outtime,
+    LAG(icu.outtime) OVER (PARTITION BY icu.hadm_id ORDER BY icu.intime) AS prev_outtime
+  FROM `physionet-data.mimiciv_3_1_icu.icustays` icu
+  INNER JOIN lung_ca_adm USING (hadm_id)
+),
+flagged AS (
+  -- a gap of >= 24h starts a genuinely new episode; a shorter gap is a transfer
+  SELECT *,
+    IF(prev_outtime IS NULL
+       OR DATETIME_DIFF(intime, prev_outtime, HOUR) >= 24, 1, 0) AS is_new_episode
+  FROM stays
+),
+numbered AS (
+  SELECT *,
+    SUM(is_new_episode) OVER (PARTITION BY hadm_id ORDER BY intime
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS episode_seq
+  FROM flagged
+)
+SELECT
+  subject_id,
+  hadm_id,
+  episode_seq,
+  MIN(stay_id)      AS first_stay_id,        -- clock starts here
+  ARRAY_AGG(stay_id ORDER BY intime) AS stay_ids,  -- all stay_ids in the episode
+  MIN(intime)       AS intime,
+  MAX(outtime)      AS outtime,
+  ANY_VALUE(first_careunit) AS first_careunit,
+  COUNT(*)          AS n_stays_merged
+FROM numbered
+GROUP BY subject_id, hadm_id, episode_seq;
+-- ---------- Step 2: first episode per patient ----------------
+CREATE OR REPLACE TABLE `BMI5101group_project.first_episode` AS
+SELECT * EXCEPT (rn) FROM (
+  SELECT e.*, ROW_NUMBER() OVER (PARTITION BY subject_id ORDER BY intime) AS rn
+  FROM `BMI5101group_project.episodes` e
+)
+WHERE rn = 1;
+
+-- ---------- Step 3: the analysis cohort ----------------------
+CREATE OR REPLACE TABLE `BMI5101group_project.cohort` AS
+WITH base AS (
+  SELECT
+    f.subject_id, f.hadm_id, f.first_stay_id, f.stay_ids,
+    f.first_careunit, f.intime, f.outtime, f.n_stays_merged,
+    DATETIME_ADD(f.intime, INTERVAL 24 HOUR) AS t0,
+    a.admittime, a.dischtime, a.deathtime,
+    a.admission_type, a.admission_location, a.discharge_location, a.insurance,
+    p.gender,
+    p.anchor_age + (EXTRACT(YEAR FROM a.admittime) - p.anchor_year) AS age_at_admission,
+    a.hospital_expire_flag
+  FROM `BMI5101group_project.first_episode` f
+  JOIN `physionet-data.mimiciv_3_1_hosp.patients`   p USING (subject_id)
+  JOIN `physionet-data.mimiciv_3_1_hosp.admissions` a USING (hadm_id)
+),
+cmo AS (
+  -- comfort-measures / DNR documented BEFORE t0 (flag, not an exclusion)
+  SELECT
+    b.first_stay_id,
+    MAX(IF(LOWER(ce.value) LIKE '%comfort%', 1, 0)) AS cmo_before_t0,
+    MAX(IF(LOWER(ce.value) LIKE '%dnr%'
+        OR LOWER(ce.value) LIKE '%dni%'
+        OR LOWER(ce.value) LIKE '%do not resuscitate%', 1, 0)) AS dnr_before_t0
+  FROM base b
+  JOIN `physionet-data.mimiciv_3_1_icu.chartevents` ce
+    ON  ce.stay_id IN UNNEST(b.stay_ids)
+    AND ce.charttime <= b.t0
+  WHERE ce.itemid = 223758          -- Code Status
+  GROUP BY b.first_stay_id
+)
+SELECT
+  b.*,
+  COALESCE(c.cmo_before_t0, 0) AS cmo_before_t0,
+  COALESCE(c.dnr_before_t0, 0) AS dnr_before_t0,
+  IF(UPPER(b.discharge_location) = 'HOSPICE', 1, 0) AS discharged_to_hospice
+FROM base b
+LEFT JOIN cmo c USING (first_stay_id)
+WHERE b.age_at_admission >= 18
+  AND DATETIME_DIFF(b.outtime, b.intime, HOUR) >= 24
+  AND (b.deathtime IS NULL OR b.deathtime > b.t0);
+
+WITH ep  AS (SELECT * FROM `BMI5101group_project.episodes`),
+     fe  AS (SELECT * FROM `BMI5101group_project.first_episode`),
+     fed AS (
+       SELECT f.*, a.deathtime, a.hospital_expire_flag,
+              p.anchor_age + (EXTRACT(YEAR FROM a.admittime) - p.anchor_year) AS age,
+              DATETIME_ADD(f.intime, INTERVAL 24 HOUR) AS t0
+       FROM fe f
+       JOIN `physionet-data.mimiciv_3_1_hosp.patients`   p USING (subject_id)
+       JOIN `physionet-data.mimiciv_3_1_hosp.admissions` a USING (hadm_id)
+     )
+SELECT 1 AS step, 'ICU episodes with lung cancer code'          AS label, COUNT(*) AS n FROM ep
+UNION ALL SELECT 2, 'First episode per patient',                 COUNT(*) FROM fe
+UNION ALL SELECT 3, 'Excluded: age under 18',                    COUNTIF(age < 18) FROM fed
+UNION ALL SELECT 4, 'Excluded: episode under 24h',               COUNTIF(age >= 18 AND DATETIME_DIFF(outtime, intime, HOUR) < 24) FROM fed
+UNION ALL SELECT 5, '   of whom died before t0',                 COUNTIF(age >= 18 AND DATETIME_DIFF(outtime, intime, HOUR) < 24 AND deathtime IS NOT NULL AND deathtime <= t0) FROM fed
+UNION ALL SELECT 6, '   of whom discharged alive before t0',     COUNTIF(age >= 18 AND DATETIME_DIFF(outtime, intime, HOUR) < 24 AND (deathtime IS NULL OR deathtime > t0)) FROM fed
+UNION ALL SELECT 7, 'ANALYSIS COHORT',                           (SELECT COUNT(*) FROM `BMI5101group_project.cohort`)
+UNION ALL SELECT 8, '   in-hospital deaths',                     (SELECT SUM(hospital_expire_flag) FROM `BMI5101group_project.cohort`)
+UNION ALL SELECT 9, '   discharged to hospice (sensitivity)',    (SELECT SUM(discharged_to_hospice) FROM `BMI5101group_project.cohort`)
+UNION ALL SELECT 10,'   CMO before t0 (sensitivity)',            (SELECT SUM(cmo_before_t0) FROM `BMI5101group_project.cohort`)
+UNION ALL SELECT 11,'   episodes merged from 2+ stay_ids',       (SELECT COUNTIF(n_stays_merged > 1) FROM `BMI5101group_project.cohort`)
+ORDER BY step;
