@@ -1,5 +1,5 @@
 -- ============================================================
--- BMI5101group_project | 02_labs_first24h.sql   (v2 - keyed on first_stay_id)
+-- P15 | 02_labs_first24h.sql   (v2 - keyed on first_stay_id)
 -- Laboratory features measured in [intime, t0]. LONG format.
 -- Run 01_cohort_v2.sql first.
 -- ============================================================
@@ -35,7 +35,16 @@ WITH lab_map AS (
     STRUCT(51275, 'ptt'),
     STRUCT(51277, 'rdw'),
     STRUCT(51279, 'rbc'),
-    STRUCT(51301, 'wbc')
+    STRUCT(51301, 'wbc'),
+    -- added to match the reference paper's variable list
+    STRUCT(50861, 'alt'),
+    STRUCT(50863, 'alp'),
+    STRUCT(50878, 'ast'),
+    STRUCT(50954, 'ldh'),
+    STRUCT(50910, 'ck'),
+    STRUCT(50802, 'base_excess'),
+    STRUCT(50821, 'po2'),
+    STRUCT(50817, 'so2')
   ])
 )
 SELECT
