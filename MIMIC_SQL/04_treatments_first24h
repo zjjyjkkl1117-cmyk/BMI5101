@@ -1,0 +1,116 @@
+-- ============================================================
+-- BMI5101group_project | 04_treatments_first24h.sql   (v2 - episode-aware)
+-- Treatment exposure STARTED before t0.
+-- ============================================================
+-- Allowed: "started by t0?", "amount delivered by t0".
+-- Never:   total duration or total dose over the whole stay.
+
+-- ---------- Vasopressors and inotropes -----------------------
+CREATE OR REPLACE TABLE `BMI5101group_project.vasopressors` AS
+WITH vaso_map AS (
+  SELECT * FROM UNNEST([
+    STRUCT(221906 AS itemid, 'norepinephrine' AS drug),
+    STRUCT(221289, 'epinephrine'), STRUCT(221749, 'phenylephrine'),
+    STRUCT(222315, 'vasopressin'), STRUCT(221662, 'dopamine'),
+    STRUCT(221653, 'dobutamine')
+  ])
+)
+SELECT
+  c.first_stay_id,
+  v.drug,
+  MIN(DATETIME_DIFF(ie.starttime, c.intime, MINUTE) / 60.0) AS hours_to_first_dose,
+  SUM(CASE WHEN ie.endtime <= c.t0 THEN ie.amount ELSE NULL END) AS amount_before_t0,
+  MAX(ie.rate) AS max_rate,
+  ANY_VALUE(ie.rateuom) AS rate_uom
+FROM `BMI5101group_project.cohort` c
+JOIN `physionet-data.mimiciv_3_1_icu.inputevents` ie
+  ON  ie.stay_id IN UNNEST(c.stay_ids)      -- episode-aware
+  AND ie.starttime >= c.intime
+  AND ie.starttime <= c.t0
+JOIN vaso_map v ON v.itemid = ie.itemid
+GROUP BY c.first_stay_id, v.drug;
+
+CREATE OR REPLACE TABLE `BMI5101group_project.vaso_features` AS
+SELECT
+  c.first_stay_id,
+  MAX(IF(v.drug = 'norepinephrine', 1, 0)) AS on_norepinephrine,
+  MAX(IF(v.drug = 'vasopressin',    1, 0)) AS on_vasopressin,
+  MAX(IF(v.drug = 'epinephrine',    1, 0)) AS on_epinephrine,
+  MAX(IF(v.drug = 'phenylephrine',  1, 0)) AS on_phenylephrine,
+  MAX(IF(v.drug = 'dopamine',       1, 0)) AS on_dopamine,
+  MAX(IF(v.drug = 'dobutamine',     1, 0)) AS on_dobutamine,
+  COUNT(DISTINCT v.drug)                   AS n_vasoactive_agents,
+  MIN(v.hours_to_first_dose)               AS hours_to_first_vasopressor
+FROM `BMI5101group_project.cohort` c
+LEFT JOIN `BMI5101group_project.vasopressors` v USING (first_stay_id)
+GROUP BY c.first_stay_id;
+
+-- ---------- Sedation and analgesia ---------------------------
+CREATE OR REPLACE TABLE `BMI5101group_project.sedation_features` AS
+WITH sed_map AS (
+  SELECT * FROM UNNEST([
+    STRUCT(222168 AS itemid, 'propofol' AS drug),
+    STRUCT(221668, 'midazolam'), STRUCT(221744, 'fentanyl'),
+    STRUCT(225942, 'fentanyl'), STRUCT(225150, 'dexmedetomidine'),
+    STRUCT(222062, 'lorazepam')
+  ])
+)
+SELECT
+  c.first_stay_id,
+  MAX(IF(s.drug IS NOT NULL, 1, 0))         AS any_sedation,
+  COUNT(DISTINCT s.drug)                    AS n_sedative_agents,
+  MAX(IF(s.drug = 'propofol', 1, 0))        AS on_propofol,
+  MAX(IF(s.drug = 'dexmedetomidine', 1, 0)) AS on_dexmedetomidine
+FROM `BMI5101group_project.cohort` c
+LEFT JOIN `physionet-data.mimiciv_3_1_icu.inputevents` ie
+  ON  ie.stay_id IN UNNEST(c.stay_ids)
+  AND ie.starttime >= c.intime
+  AND ie.starttime <= c.t0
+LEFT JOIN sed_map s ON s.itemid = ie.itemid
+GROUP BY c.first_stay_id;
+
+-- ---------- Mechanical ventilation (START only) --------------
+CREATE OR REPLACE TABLE `BMI5101group_project.ventilation_features` AS
+SELECT
+  c.first_stay_id,
+  MAX(IF(v.ventilation_status IN ('InvasiveVent','Tracheostomy'), 1, 0)) AS invasive_vent_by_t0,
+  MAX(IF(v.ventilation_status IN ('NonInvasiveVent','HFNC'), 1, 0))      AS niv_or_hfnc_by_t0,
+  MIN(DATETIME_DIFF(v.starttime, c.intime, MINUTE) / 60.0)               AS hours_to_vent_start,
+  SUM(DATETIME_DIFF(
+        LEAST(COALESCE(v.endtime, c.t0), c.t0),
+        GREATEST(v.starttime, c.intime), MINUTE) / 60.0)                 AS vent_hours_within_24h
+FROM `BMI5101group_project.cohort` c
+LEFT JOIN `physionet-data.mimiciv_3_1_derived.ventilation` v
+  ON  v.stay_id IN UNNEST(c.stay_ids)
+  AND v.starttime <= c.t0
+GROUP BY c.first_stay_id;
+
+-- ---------- Oncology and other drugs before t0 ---------------
+CREATE OR REPLACE TABLE `BMI5101group_project.onc_drug_features` AS
+WITH onc AS (
+  SELECT c.first_stay_id, LOWER(pr.drug) AS drug_lc
+  FROM `BMI5101group_project.cohort` c
+  JOIN `physionet-data.mimiciv_3_1_hosp.prescriptions` pr
+    ON  pr.hadm_id    = c.hadm_id
+    AND pr.starttime <= c.t0
+)
+SELECT
+  c.first_stay_id,
+  MAX(IF(REGEXP_CONTAINS(o.drug_lc,
+      r'carboplatin|cisplatin|pemetrexed|etoposide|paclitaxel|docetaxel|gemcitabine|vinorelbine'), 1, 0)) AS cytotoxic_chemo,
+  MAX(IF(REGEXP_CONTAINS(o.drug_lc,
+      r'pembrolizumab|nivolumab|atezolizumab|durvalumab|ipilimumab'), 1, 0)) AS immunotherapy,
+  MAX(IF(REGEXP_CONTAINS(o.drug_lc,
+      r'osimertinib|erlotinib|gefitinib|afatinib|alectinib|crizotinib|lorlatinib|bevacizumab'), 1, 0)) AS targeted_therapy,
+  MAX(IF(REGEXP_CONTAINS(o.drug_lc, r'dexamethasone|prednisone|methylprednisolone|hydrocortisone'), 1, 0)) AS corticosteroid,
+  MAX(IF(REGEXP_CONTAINS(o.drug_lc, r'heparin|enoxaparin|warfarin|apixaban|rivaroxaban'), 1, 0)) AS anticoagulant
+FROM `BMI5101group_project.cohort` c
+LEFT JOIN onc o USING (first_stay_id)
+GROUP BY c.first_stay_id;
+
+-- Check actual drug names before trusting the regex above.
+SELECT LOWER(pr.drug) AS drug_lc, COUNT(*) AS n
+FROM `BMI5101group_project.cohort` c
+JOIN `physionet-data.mimiciv_3_1_hosp.prescriptions` pr ON pr.hadm_id = c.hadm_id
+WHERE REGEXP_CONTAINS(LOWER(pr.drug), r'platin|taxel|mab$|tinib|pemetrexed|etoposide|gemcitabine')
+GROUP BY drug_lc ORDER BY n DESC LIMIT 50;
