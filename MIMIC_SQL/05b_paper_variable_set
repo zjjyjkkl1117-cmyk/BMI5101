@@ -1,0 +1,188 @@
+-- ============================================================
+-- P15 | 05b_paper_variable_set.sql
+-- Variables the reference paper used that our scripts 02-05 lacked.
+-- Run after 05, before 06.
+-- ============================================================
+-- ------------------------------------------------------------
+-- 1. Severity scores (legitimately first-24h by definition)
+-- ------------------------------------------------------------
+-- CAVEAT for the clinician to check before trusting sapsii:
+-- MIT's sapsii concept awards points for metastatic cancer, haematologic
+-- malignancy and AIDS, which it derives from DISCHARGE ICD codes. That
+-- component is not knowable at t0. Read the concept SQL in the mimic-code
+-- repo and decide whether to (a) accept it as the paper did, or (b) rebuild
+-- SAPS II without the comorbidity points. Report whichever you choose.
+-- COLUMN NAMES: first_day_sofa DROPS the _24hours suffix. The mimic-code
+-- concept selects  sofa_24hours AS sofa, respiration_24hours AS respiration, ...
+-- so the columns here are sofa / respiration / coagulation / liver /
+-- cardiovascular / cns / renal.  (The _24hours names live in the hourly
+-- `sofa` table, not in first_day_sofa.)
+-- Verify before running:
+--   SELECT column_name FROM `physionet-data.mimiciv_3_1_derived.INFORMATION_SCHEMA.COLUMNS`
+--   WHERE table_name IN ('first_day_sofa','sapsii','apsiii') ORDER BY table_name, ordinal_position;
+
+CREATE OR REPLACE TABLE `BMI5101group_project.severity_scores` AS
+SELECT
+  c.first_stay_id,
+  s.sapsii,
+  s.sapsii_prob,
+  a.apsiii,
+  a.apsiii_prob,
+  f.sofa           AS sofa_day1,
+  f.respiration    AS sofa_resp,
+  f.coagulation    AS sofa_coag,
+  f.liver          AS sofa_liver,
+  f.cardiovascular AS sofa_cardio,
+  f.cns            AS sofa_cns,
+  f.renal          AS sofa_renal
+FROM `BMI5101group_project.cohort` c
+LEFT JOIN `physionet-data.mimiciv_3_1_derived.sapsii`         s ON s.stay_id = c.first_stay_id
+LEFT JOIN `physionet-data.mimiciv_3_1_derived.apsiii`         a ON a.stay_id = c.first_stay_id
+LEFT JOIN `physionet-data.mimiciv_3_1_derived.first_day_sofa` f ON f.stay_id = c.first_stay_id;
+
+-- FALLBACK if first_day_sofa is missing or named differently in your version:
+-- build the day-1 SOFA straight from the hourly `sofa` concept at hr = 24,
+-- where the columns DO carry the _24hours suffix.
+--
+-- CREATE OR REPLACE TABLE `BMI5101group_project.severity_scores` AS
+-- SELECT
+--   c.first_stay_id, s.sapsii, s.sapsii_prob, a.apsiii, a.apsiii_prob,
+--   sf.sofa_24hours           AS sofa_day1,
+--   sf.respiration_24hours    AS sofa_resp,
+--   sf.coagulation_24hours    AS sofa_coag,
+--   sf.liver_24hours          AS sofa_liver,
+--   sf.cardiovascular_24hours AS sofa_cardio,
+--   sf.cns_24hours            AS sofa_cns,
+--   sf.renal_24hours          AS sofa_renal
+-- FROM `BMI5101group_project.cohort` c
+-- LEFT JOIN `physionet-data.mimiciv_3_1_derived.sapsii` s ON s.stay_id = c.first_stay_id
+-- LEFT JOIN `physionet-data.mimiciv_3_1_derived.apsiii` a ON a.stay_id = c.first_stay_id
+-- LEFT JOIN `physionet-data.mimiciv_3_1_derived.sofa`  sf ON sf.stay_id = c.first_stay_id
+--                                                    AND sf.hr = 24;
+
+-- ------------------------------------------------------------
+-- 2. Demographics the paper used but our cohort table omitted
+-- ------------------------------------------------------------
+CREATE OR REPLACE TABLE `BMI5101group_project.paper_demographics` AS
+SELECT
+  c.first_stay_id,
+  a.race,
+  IF(UPPER(a.race) LIKE 'WHITE%', 1, 0) AS race_white,   -- the paper's own split
+  w.weight_admit_kg
+FROM `BMI5101group_project.cohort` c
+JOIN `physionet-data.mimiciv_3_1_hosp.admissions` a USING (hadm_id)
+LEFT JOIN (
+  SELECT c2.first_stay_id,
+         AVG(ce.valuenum) AS weight_admit_kg
+  FROM `BMI5101group_project.cohort` c2
+  JOIN `physionet-data.mimiciv_3_1_icu.chartevents` ce
+    ON  ce.stay_id IN UNNEST(c2.stay_ids)
+    AND ce.charttime <= c2.t0
+  WHERE ce.itemid IN (226512, 224639)      -- admission weight, daily weight
+    AND ce.valuenum BETWEEN 20 AND 400
+  GROUP BY c2.first_stay_id
+) w ON w.first_stay_id = c.first_stay_id;
+
+-- ------------------------------------------------------------
+-- 3. CRRT and the remaining drugs in the paper's 27 variables
+-- ------------------------------------------------------------
+CREATE OR REPLACE TABLE `BMI5101group_project.paper_treatments` AS
+WITH crrt AS (
+  SELECT c.first_stay_id, 1 AS crrt_by_t0
+  FROM `BMI5101group_project.cohort` c
+  JOIN `physionet-data.mimiciv_3_1_derived.crrt` r
+    ON  r.stay_id IN UNNEST(c.stay_ids)
+    AND r.charttime <= c.t0
+  GROUP BY c.first_stay_id
+),
+losartan AS (
+  SELECT c.first_stay_id, 1 AS losartan_by_t0
+  FROM `BMI5101group_project.cohort` c
+  JOIN `physionet-data.mimiciv_3_1_hosp.prescriptions` pr
+    ON  pr.hadm_id    = c.hadm_id
+    AND pr.starttime <= c.t0
+  WHERE REGEXP_CONTAINS(LOWER(pr.drug), r'losartan')
+  GROUP BY c.first_stay_id
+)
+SELECT
+  c.first_stay_id,
+  COALESCE(r.crrt_by_t0, 0)     AS crrt_by_t0,
+  COALESCE(l.losartan_by_t0, 0) AS losartan_by_t0
+FROM `BMI5101group_project.cohort` c
+LEFT JOIN crrt     r USING (first_stay_id)
+LEFT JOIN losartan l USING (first_stay_id);
+
+-- ------------------------------------------------------------
+-- 4. THE LEAKY VARIABLES  -  Model A only, never Model B
+-- ------------------------------------------------------------
+-- These are the paper's top features. They are only knowable after the
+-- outcome has played out. Keeping them in a separate table makes the
+-- leakage visible in the schema itself, not just in a comment.
+CREATE OR REPLACE TABLE `BMI5101group_project.leaky_vars` AS
+SELECT
+  c.first_stay_id,
+  DATETIME_DIFF(c.dischtime, c.admittime, HOUR) / 24.0 AS los_hospital_days,  -- paper's #1
+  DATETIME_DIFF(c.outtime,   c.intime,    HOUR) / 24.0 AS los_icu_days,
+  v.ventilator_hours,                                                          -- paper's #7
+  ch.charlson_comorbidity_index                                                -- discharge-coded
+FROM `BMI5101group_project.cohort` c
+LEFT JOIN (
+  SELECT c2.first_stay_id,
+         SUM(DATETIME_DIFF(vd.endtime, vd.starttime, MINUTE)) / 60.0 AS ventilator_hours
+  FROM `BMI5101group_project.cohort` c2
+  JOIN `physionet-data.mimiciv_3_1_derived.ventilation` vd
+    ON vd.stay_id IN UNNEST(c2.stay_ids)
+  GROUP BY c2.first_stay_id
+) v ON v.first_stay_id = c.first_stay_id
+LEFT JOIN `physionet-data.mimiciv_3_1_derived.charlson` ch ON ch.hadm_id = c.hadm_id;
+
+-- ------------------------------------------------------------
+-- 5. Did we reproduce the paper's distributions?
+-- ------------------------------------------------------------
+-- Paper's Table 1 (n=1,755): SAPS II 39.93 (12.50), SOFA 1.11 (1.56),
+-- ventilator 79.3%, ventilator_hours 62.28 (83.37), vasopressin 4.8%,
+-- norepinephrine 13.9%, CRRT 1.3%, LOS hospital 10.18 (8.99) days.
+SELECT
+  COUNT(*)                                   AS n,
+  ROUND(AVG(s.sapsii), 2)                    AS sapsii_mean,
+  ROUND(STDDEV(s.sapsii), 2)                 AS sapsii_sd,
+  ROUND(AVG(s.sofa_day1), 2)                 AS sofa_mean,
+  ROUND(AVG(lv.ventilator_hours), 2)         AS vent_hours_mean,
+  ROUND(AVG(lv.los_hospital_days), 2)        AS los_hosp_mean,
+  ROUND(100 * AVG(t.crrt_by_t0), 1)          AS pct_crrt
+FROM `BMI5101group_project.cohort` c
+LEFT JOIN `BMI5101group_project.severity_scores`  s  USING (first_stay_id)
+LEFT JOIN `BMI5101group_project.leaky_vars`       lv USING (first_stay_id)
+LEFT JOIN `BMI5101group_project.paper_treatments` t  USING (first_stay_id);
+
+-- ------------------------------------------------------------
+-- 6. Paper-fidelity flag: patients the paper would have excluded
+-- ------------------------------------------------------------
+-- The paper excluded 1,106 patients with "repeated ICU and hospital
+-- admissions". We keep them (excluding on future events is itself a bias),
+-- but Model A can filter on this flag to get closer to the paper's n=1,755.
+-- Put the two numbers side by side on the Methods slide.
+CREATE OR REPLACE TABLE `BMI5101group_project.paper_fidelity_flags` AS
+WITH counts AS (
+  SELECT
+    c.first_stay_id,
+    c.subject_id,
+    (SELECT COUNT(*) FROM `physionet-data.mimiciv_3_1_hosp.admissions` a
+      WHERE a.subject_id = c.subject_id)            AS n_hosp_admissions,
+    (SELECT COUNT(*) FROM `physionet-data.mimiciv_3_1_icu.icustays` i
+      WHERE i.subject_id = c.subject_id)            AS n_icu_stays
+  FROM `BMI5101group_project.cohort` c
+)
+SELECT
+  first_stay_id,
+  n_hosp_admissions,
+  n_icu_stays,
+  IF(n_hosp_admissions > 1 OR n_icu_stays > 1, 1, 0) AS paper_would_exclude
+FROM counts;
+
+-- How many would the paper have dropped?
+SELECT
+  COUNT(*)                            AS our_cohort,
+  SUM(paper_would_exclude)            AS would_be_excluded_by_paper,
+  COUNT(*) - SUM(paper_would_exclude) AS paper_equivalent_n
+FROM `BMI5101group_project.paper_fidelity_flags`;
