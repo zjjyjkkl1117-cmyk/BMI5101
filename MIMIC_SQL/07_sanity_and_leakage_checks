@@ -1,5 +1,5 @@
 -- ============================================================
--- BMI5101group_project | 07_sanity_and_leakage_checks.sql   (v2)
+-- P15 | 07_sanity_and_leakage_checks.sql   (v2)
 -- Run before anyone trains a model.
 -- ============================================================
 
@@ -22,12 +22,21 @@ SELECT COUNT(*) AS patients_with_multiple_rows FROM (
   SELECT subject_id FROM `BMI5101group_project.analysis_table`
   GROUP BY subject_id HAVING COUNT(*) > 1);
 
--- 4. No leaky column reached the analysis table. Must return 0 rows.
+-- 4. No leaky column reached Model B. Must return 0 rows.
+--    NOTE: the pattern must NOT match 'losartan_by_t0', which is a legitimate
+--    t0-safe drug feature. Hence los_hospital / los_icu / _los_ rather than 'los'.
+SELECT table_name, column_name
+FROM `BMI5101group_project.INFORMATION_SCHEMA.COLUMNS`
+WHERE table_name = 'analysis_table'          -- Model B only; A is leaky by design
+  AND REGEXP_CONTAINS(LOWER(column_name),
+      r'outtime|dischtime|deathtime|los_hospital|los_icu|_los_days|expire_flag|charlson|ventilator_hours|vent_duration|discharge_location');
+
+-- 4b. The faithful table SHOULD contain them. Expect 4 rows.
 SELECT column_name
 FROM `BMI5101group_project.INFORMATION_SCHEMA.COLUMNS`
-WHERE table_name = 'analysis_table'
+WHERE table_name = 'analysis_table_faithful'
   AND REGEXP_CONTAINS(LOWER(column_name),
-      r'outtime|dischtime|deathtime|los|expire_flag|charlson|vent_duration|discharge_location');
+      r'los_hospital|los_icu|ventilator_hours|charlson');
 
 -- 5. Missingness per column (edit the list; this is the pattern).
 SELECT
@@ -36,7 +45,10 @@ SELECT
   ROUND(100 * COUNTIF(mean_albumin  IS NULL) / COUNT(*), 1) AS pct_missing_albumin,
   ROUND(100 * COUNTIF(mean_bun      IS NULL) / COUNT(*), 1) AS pct_missing_bun,
   ROUND(100 * COUNTIF(gcs_total_min IS NULL) / COUNT(*), 1) AS pct_missing_gcs,
-  ROUND(100 * COUNTIF(mean_spo2     IS NULL) / COUNT(*), 1) AS pct_missing_spo2
+  ROUND(100 * COUNTIF(mean_spo2     IS NULL) / COUNT(*), 1) AS pct_missing_spo2,
+  ROUND(100 * COUNTIF(sapsii        IS NULL) / COUNT(*), 1) AS pct_missing_sapsii,
+  ROUND(100 * COUNTIF(sofa_day1     IS NULL) / COUNT(*), 1) AS pct_missing_sofa,
+  ROUND(100 * COUNTIF(mean_ldh      IS NULL) / COUNT(*), 1) AS pct_missing_ldh
 FROM `BMI5101group_project.analysis_table`;
 
 -- 6. Outcome prevalence under each definition.
@@ -71,4 +83,6 @@ SELECT 'cohort' AS t, COUNT(*) AS n FROM `BMI5101group_project.cohort`
 UNION ALL SELECT 'analysis_table',  COUNT(*) FROM `BMI5101group_project.analysis_table`
 UNION ALL SELECT 'labs_features',   COUNT(DISTINCT first_stay_id) FROM `BMI5101group_project.labs_features`
 UNION ALL SELECT 'vitals_features', COUNT(DISTINCT first_stay_id) FROM `BMI5101group_project.vitals_features`
+UNION ALL SELECT 'analysis_table_faithful', COUNT(*) FROM `BMI5101group_project.analysis_table_faithful`
+UNION ALL SELECT 'severity_scores', COUNT(*) FROM `BMI5101group_project.severity_scores`
 ORDER BY t;
