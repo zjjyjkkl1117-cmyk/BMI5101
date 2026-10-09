@@ -1,5 +1,5 @@
 -- ============================================================
--- BMI5101group_project | 06_outcome_and_analysis_table.sql   (v2)
+-- P15| 06_outcome_and_analysis_table.sql   (v2)
 -- Outcomes + the modelling table.
 -- ============================================================
 
@@ -25,7 +25,8 @@ PIVOT (
   MAX(val_last) AS last, MAX(val_slope_per_hour) AS slope
   FOR feature IN ('wbc','hemoglobin','platelet','sodium','potassium','chloride',
                   'bicarbonate','anion_gap','bun','creatinine','glucose','lactate',
-                  'albumin','bilirubin_total','pt','inr','ptt','ph','rdw','mcv')
+                  'albumin','bilirubin_total','pt','inr','ptt','ph','rdw','mcv',
+                  'alt','alp','ast','ldh','ck','base_excess','po2','so2')
 );
 
 -- ---------- Wide vitals --------------------------------------
@@ -65,6 +66,9 @@ SELECT
   vent.* EXCEPT (first_stay_id),
   onc.*  EXCEPT (first_stay_id),
   g.gcs_total_min,
+  sev.*  EXCEPT (first_stay_id),
+  pd.*   EXCEPT (first_stay_id),
+  pt.*   EXCEPT (first_stay_id),
   lw.*   EXCEPT (first_stay_id),
   vw.*   EXCEPT (first_stay_id),
   -- outcomes last
@@ -79,10 +83,33 @@ LEFT JOIN `BMI5101group_project.sedation_features`    sf   USING (first_stay_id)
 LEFT JOIN `BMI5101group_project.ventilation_features` vent USING (first_stay_id)
 LEFT JOIN `BMI5101group_project.onc_drug_features`    onc  USING (first_stay_id)
 LEFT JOIN `BMI5101group_project.gcs_min`              g    USING (first_stay_id)
+LEFT JOIN `BMI5101group_project.severity_scores`      sev  USING (first_stay_id)
+LEFT JOIN `BMI5101group_project.paper_demographics`   pd   USING (first_stay_id)
+LEFT JOIN `BMI5101group_project.paper_treatments`     pt   USING (first_stay_id)
 LEFT JOIN `BMI5101group_project.labs_wide`            lw   USING (first_stay_id)
 LEFT JOIN `BMI5101group_project.vitals_wide`          vw   USING (first_stay_id)
 LEFT JOIN `BMI5101group_project.outcomes`             o    USING (first_stay_id);
 
+-- ---------- COLUMN NAMING (read this) -----------------------
+-- BigQuery names pivoted columns  <aggregate_alias>_<feature_value>,
+-- so the aliases above produce:
+--     mean_bun, max_lactate, min_spo2, slope_creatinine,
+--     sd_heart_rate, early_map, late_map, last_wbc, ...
+-- NOT bun_mean / lactate_max. List the real names any time with:
+--   SELECT column_name FROM `BMI5101group_project.INFORMATION_SCHEMA.COLUMNS`
+--   WHERE table_name = 'analysis_table' ORDER BY ordinal_position;
+
+-- ---------- Model A: faithful replication (LEAKY, on purpose) ----
+-- Same rows, plus the paper's whole-stay variables. Use this ONLY to
+-- reproduce AUC ~0.790 and to quantify how much of it the leakage bought.
+-- Every figure from this table must be labelled "not deployable".
+CREATE OR REPLACE TABLE `BMI5101group_project.analysis_table_faithful` AS
+SELECT a.*, lv.* EXCEPT (first_stay_id), pf.paper_would_exclude
+FROM `BMI5101group_project.analysis_table` a
+LEFT JOIN `BMI5101group_project.leaky_vars`          lv USING (first_stay_id)
+LEFT JOIN `BMI5101group_project.paper_fidelity_flags` pf USING (first_stay_id);
+-- For the closest match to the paper's n=1,755, add:
+--   WHERE paper_would_exclude = 0
 
 -- ---------- Table 1 starter ----------------------------------
 SELECT
