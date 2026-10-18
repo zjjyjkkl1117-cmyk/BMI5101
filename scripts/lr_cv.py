@@ -1,8 +1,12 @@
 """P15: shared patient-level 5-fold CV, fold-safe L1 selection + logistic regression.
 
+Numeric predictors are clipped to the 1st-99th percentile of the training fold before
+imputation (LR is sensitive to extreme values; tree models are not).
+
 Usage (from project root):
     python scripts/lr_cv.py
     python scripts/lr_cv.py --final-test  # only after model choices are frozen; needs metrics.py
+    python scripts/lr_cv.py --final-test --no-clip  # sensitivity analysis without clipping
 """
 from __future__ import annotations
 
@@ -14,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, OneToOneFeatureMixin, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.feature_selection import SelectFromModel
 from sklearn.impute import SimpleImputer
@@ -22,6 +27,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.utils.validation import check_is_fitted, validate_data
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 # sklearn >= 1.8 warns that `penalty` is deprecated; penalty="l1" still applies L1 (kept to match xgboost_cv.py).
@@ -71,15 +77,44 @@ def get_folds(a_train: pd.DataFrame, fold_file: Path) -> np.ndarray:
     return folds
 
 
-def build_pipeline(x: pd.DataFrame) -> Pipeline:
+class QuantileClipper(OneToOneFeatureMixin, TransformerMixin, BaseEstimator):
+    """Clip each column to [lower, upper] quantiles learned on the training data.
+
+    Binary columns (two or fewer distinct values) and all-missing columns are left
+    unchanged; missing values stay missing.
+    """
+
+    def __init__(self, lower: float = 0.01, upper: float = 0.99):
+        self.lower = lower
+        self.upper = upper
+
+    def fit(self, X, y=None):
+        X = validate_data(self, X, ensure_all_finite="allow-nan", dtype=float)
+        self.low_ = np.full(X.shape[1], -np.inf)
+        self.high_ = np.full(X.shape[1], np.inf)
+        for j in range(X.shape[1]):
+            col = X[~np.isnan(X[:, j]), j]
+            if np.unique(col).size > 2:
+                self.low_[j], self.high_[j] = np.quantile(col, [self.lower, self.upper])
+        return self
+
+    def transform(self, X):
+        check_is_fitted(self)
+        X = validate_data(self, X, ensure_all_finite="allow-nan", dtype=float, reset=False)
+        return np.clip(X, self.low_, self.high_)
+
+
+def build_pipeline(x: pd.DataFrame, clip: bool = True) -> Pipeline:
     numeric = x.select_dtypes(include=np.number).columns.tolist()
     categorical = [c for c in x if c not in numeric]
+    numeric_steps = [("clip", QuantileClipper())] if clip else []
+    numeric_steps += [
+        ("impute", SimpleImputer(strategy="median", keep_empty_features=True,
+                                 add_indicator=True)),
+        ("scale", StandardScaler()),
+    ]
     prep = ColumnTransformer([
-        ("numeric", Pipeline([
-            ("impute", SimpleImputer(strategy="median", keep_empty_features=True,
-                                     add_indicator=True)),
-            ("scale", StandardScaler()),
-        ]), numeric),
+        ("numeric", Pipeline(numeric_steps), numeric),
         ("categorical", Pipeline([
             ("impute", SimpleImputer(strategy="constant", fill_value="MISSING")),
             ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
@@ -113,10 +148,16 @@ def main():
     project = Path(__file__).resolve().parent.parent
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", type=Path, default=project / "splits")
-    p.add_argument("--output-dir", type=Path, default=project / "results" / "lr")
+    p.add_argument("--output-dir", type=Path, default=None,
+                   help="Default: results/lr (results/lr_no_clip with --no-clip)")
     p.add_argument("--final-test", action="store_true",
                    help="Fit full training sets and evaluate held-out test ONCE")
+    p.add_argument("--no-clip", action="store_true",
+                   help="Sensitivity analysis: skip the 1st-99th percentile clipping")
     args = p.parse_args()
+    clip = not args.no_clip
+    if args.output_dir is None:
+        args.output_dir = project / "results" / ("lr" if clip else "lr_no_clip")
     if args.final_test:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         try:
@@ -142,7 +183,7 @@ def main():
         oof = np.full(len(tr), np.nan)
         for fold in range(FOLDS):
             ti, vi = np.flatnonzero(folds != fold), np.flatnonzero(folds == fold)
-            pipe = build_pipeline(x).fit(x.iloc[ti], y[ti])
+            pipe = build_pipeline(x, clip).fit(x.iloc[ti], y[ti])
             oof[vi] = pipe.predict_proba(x.iloc[vi])[:, 1]
             chosen = selected_names(pipe)
             fold_rows.append({"model": name, "fold": fold, "n_train": len(ti),
@@ -158,7 +199,7 @@ def main():
                          "cv_pooled_auroc": float(roc_auc_score(y, oof))}
 
         if args.final_test:
-            final = build_pipeline(x).fit(x, y)
+            final = build_pipeline(x, clip).fit(x, y)
             p_tr = final.predict_proba(x)[:, 1]
             p_te = final.predict_proba(te[cols])[:, 1]
             table = evaluate_model(f"LR_{name}", y, p_tr, te[TARGET].to_numpy(), p_te, oof)
@@ -198,6 +239,7 @@ def main():
 
     (out / "run_summary.json").write_text(json.dumps({
         "split_dir": str(args.data_dir), "folds": FOLDS, "seed": SEED,
+        "clip_numeric_1_99": clip,
         "lasso": "L1 LogisticRegression(liblinear, C=0.5), same as xgboost_cv.py",
         "lr": "LogisticRegressionCV(L2, inner 5-fold, scoring=roc_auc)",
         "C_grid": C_GRID.tolist(), "final_test_run": args.final_test, "models": summary,
