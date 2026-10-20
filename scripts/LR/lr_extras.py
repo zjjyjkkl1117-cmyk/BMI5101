@@ -1,13 +1,13 @@
 """P15: supplementary analyses for the logistic regression model (lr_cv.py).
 
 Calibration (raw / temperature scaling / isotonic regression), decision curve
-analysis, SHAP, the temporal-feature comparison (Model B with vs without
-early_/late_/slope_/sd_ features), and a sensitivity analysis without the
-1st-99th percentile clipping. Same split, folds and pipeline as lr_cv.py.
-Recalibration maps are learned on training out-of-fold probabilities only.
+analysis, SHAP, and the temporal-feature and leakage comparisons (Model B with vs
+without early_/late_/slope_/sd_ features; Model A vs Model B). Same split, folds,
+pipeline and frozen LASSO C as lr_cv.py. Recalibration maps are learned on
+training out-of-fold probabilities (shared 5-fold splits) only.
 
-Usage (from project root):
-    python scripts/lr_extras.py
+Usage (from project root, after `python scripts/LR/lr_cv.py --stage tune`):
+    python scripts/LR/lr_extras.py
 """
 from __future__ import annotations
 
@@ -28,9 +28,10 @@ from scipy.special import expit, logit
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path[:0] = [str(Path(__file__).resolve().parent),  # scripts/LR (lr_cv.py)
+                str(Path(__file__).resolve().parents[1])]  # scripts (metrics.py)
 from lr_cv import (DROP_FEATURES, FOLDS, ID, SEED, TARGET,  # noqa: E402
-                   build_pipeline, get_folds, load_data)
+                   build_pipeline, get_folds, load_best_config, load_data, output_dir)
 
 TEMPORAL_PREFIXES = ("early_", "late_", "slope_", "sd_")
 N_BOOT = 2000
@@ -65,16 +66,16 @@ def new_figure(ncols=1, width=6.0, height=4.6):
     return fig, axes.ravel()
 
 
-def fit_cv_and_final(x, y, x_test, folds, clip=True):
+def fit_cv_and_final(x, y, x_test, folds, lasso_c):
     """Out-of-fold training probabilities, then a final fit on all training data."""
     oof = np.full(len(y), np.nan)
     fold_auc = []
     for fold in range(FOLDS):
         ti, vi = np.flatnonzero(folds != fold), np.flatnonzero(folds == fold)
-        pipe = build_pipeline(x, clip).fit(x.iloc[ti], y[ti])
+        pipe = build_pipeline(x, lasso_c=lasso_c).fit(x.iloc[ti], y[ti])
         oof[vi] = pipe.predict_proba(x.iloc[vi])[:, 1]
         fold_auc.append(roc_auc_score(y[vi], oof[vi]))
-    final = build_pipeline(x, clip).fit(x, y)
+    final = build_pipeline(x, lasso_c=lasso_c).fit(x, y)
     return oof, final.predict_proba(x_test)[:, 1], final, fold_auc
 
 
@@ -132,7 +133,7 @@ def clean_name(name: str) -> str:
 
 
 def main():
-    project = Path(__file__).resolve().parent.parent
+    project = Path(__file__).resolve().parents[2]
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", type=Path, default=project / "splits")
     p.add_argument("--output-dir", type=Path, default=project / "results" / "lr" / "extras")
@@ -148,19 +149,20 @@ def main():
 
     a_cols = [c for c in a_train.columns if c not in DROP_FEATURES]
     b_cols = [c for c in b_train.columns if c not in DROP_FEATURES]
-    # name: (train, test, columns, clip numeric predictors)
+    lr_out = output_dir(project, clip=True)
+    c_a = load_best_config(lr_out, "A")["lasso_C"]
+    c_b = load_best_config(lr_out, "B")["lasso_C"]
+    # name: (train, test, columns, frozen LASSO C from lr_cv.py --stage tune)
     feature_sets = {
-        "LR_A": (a_train, a_test, a_cols, True),
-        "LR_B": (b_train, b_test, b_cols, True),
+        "LR_A": (a_train, a_test, a_cols, c_a),
+        "LR_B": (b_train, b_test, b_cols, c_b),
         "LR_B_no_temporal": (b_train, b_test,
-                             [c for c in b_cols if not c.startswith(TEMPORAL_PREFIXES)], True),
-        "LR_A_no_clip": (a_train, a_test, a_cols, False),
-        "LR_B_no_clip": (b_train, b_test, b_cols, False),
+                             [c for c in b_cols if not c.startswith(TEMPORAL_PREFIXES)], c_b),
     }
     fits = {}
-    for name, (tr, te, cols, clip) in feature_sets.items():
-        print(f"Fitting {name} ({len(cols)} raw predictors) ...", flush=True)
-        oof, p_te, final, fold_auc = fit_cv_and_final(tr[cols], y, te[cols], folds, clip)
+    for name, (tr, te, cols, lasso_c) in feature_sets.items():
+        print(f"Fitting {name} ({len(cols)} raw predictors, LASSO C={lasso_c}) ...", flush=True)
+        oof, p_te, final, fold_auc = fit_cv_and_final(tr[cols], y, te[cols], folds, lasso_c)
         fits[name] = {"oof": oof, "test": p_te, "final": final, "fold_auc": fold_auc,
                       "cols": cols, "x_train": tr[cols], "x_test": te[cols]}
 
@@ -276,12 +278,10 @@ def main():
         plt.savefig(out / f"shap_beeswarm_{name}.png", dpi=160)
         plt.close("all")
 
-    # 4) Comparisons: temporal features, leakage, and the clipping step
+    # 4) Comparisons: temporal features and leakage
     comp_rows = []
     for label, m1, m2 in [("Temporal features: LR_B vs LR_B_no_temporal", "LR_B", "LR_B_no_temporal"),
-                          ("Leaky variables: LR_A vs LR_B", "LR_A", "LR_B"),
-                          ("Clipping: LR_A vs LR_A_no_clip", "LR_A", "LR_A_no_clip"),
-                          ("Clipping: LR_B vs LR_B_no_clip", "LR_B", "LR_B_no_clip")]:
+                          ("Leaky variables: LR_A vs LR_B", "LR_A", "LR_B")]:
         for cohort, yy, key in [("Train (5-fold CV, pooled OOF)", y, "oof"), ("Test", y_test, "test")]:
             diff, lo, hi, pval = paired_bootstrap_auc(yy, fits[m1][key], fits[m2][key])
             comp_rows.append({"comparison": label, "cohort": cohort,
@@ -291,16 +291,6 @@ def main():
                               "bootstrap_p": pval})
     pd.DataFrame(comp_rows).to_csv(out / "model_comparisons.csv", index=False)
 
-    clip_rows = []
-    for name in ["LR_A", "LR_A_no_clip", "LR_B", "LR_B_no_clip"]:
-        prob = fits[name]["test"]
-        intercept, slope = calibration_intercept_slope(prob, y_test)
-        clip_rows.append({"model": name, "test_auroc": roc_auc_score(y_test, prob),
-                          "test_brier": brier_score_loss(y_test, prob),
-                          "calibration_intercept": intercept, "calibration_slope": slope,
-                          "max_predicted": float(prob.max()),
-                          "n_predicted_above_0_99": int((prob > 0.99).sum())})
-    pd.DataFrame(clip_rows).to_csv(out / "clipping_sensitivity.csv", index=False)
     pd.DataFrame({name: fits[name]["fold_auc"] for name in fits}).rename_axis("fold") \
         .reset_index().to_csv(out / "cv_fold_auroc_by_model.csv", index=False)
 
@@ -316,8 +306,6 @@ def main():
     print(pd.DataFrame(cal_rows).round(3).to_string(index=False))
     print("\nModel comparisons (AUROC difference, paired bootstrap 95% CI):")
     print(pd.DataFrame(comp_rows).round(3).to_string(index=False))
-    print("\nClipping sensitivity (test set):")
-    print(pd.DataFrame(clip_rows).round(3).to_string(index=False))
     print("\nDCA: threshold range where model beats treat-all and treat-none:", dca_summary)
     print("SHAP top 10:", json.dumps(shap_summary, indent=1))
     print("Saved to", out.name)

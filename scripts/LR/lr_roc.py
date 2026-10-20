@@ -1,11 +1,11 @@
 """P15: ROC curves for the logistic regression models (training and test cohorts).
 
-Refits the final lr_cv.py pipeline (with clipping) on all training patients and
+Refits the final lr_cv.py pipeline (clipping + frozen LASSO C) on all training patients and
 plots ROC curves for Model A and Model B, in the format of the paper's Figure 3:
 (A) training cohort (apparent), (B) test cohort. AUROC 95% CIs use metrics.py.
 
 Usage (from project root):
-    python scripts/lr_roc.py
+    python scripts/LR/lr_roc.py
 """
 from __future__ import annotations
 
@@ -19,8 +19,10 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from sklearn.metrics import roc_curve
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lr_cv import DROP_FEATURES, TARGET, build_pipeline, load_data  # noqa: E402
+sys.path[:0] = [str(Path(__file__).resolve().parent),  # scripts/LR (lr_cv.py)
+                str(Path(__file__).resolve().parents[1])]  # scripts (metrics.py)
+from lr_cv import (DROP_FEATURES, TARGET, build_pipeline, load_best_config,  # noqa: E402
+                   load_data, output_dir)
 from metrics import auroc_ci  # noqa: E402
 
 SURFACE, INK, INK2, MUTED = "#fcfcfb", "#0b0b0b", "#52514e", "#898781"
@@ -29,7 +31,7 @@ COLORS = {"Model A": "#2a78d6", "Model B": "#eb6834"}
 
 
 def main():
-    project = Path(__file__).resolve().parent.parent
+    project = Path(__file__).resolve().parents[2]
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", type=Path, default=project / "splits")
     p.add_argument("--output-dir", type=Path, default=project / "results" / "lr" / "extras")
@@ -41,7 +43,8 @@ def main():
     for label, name in [("Model A", "A"), ("Model B", "B")]:
         tr, te = load_data(args.data_dir, name)
         cols = [c for c in tr.columns if c not in DROP_FEATURES]
-        final = build_pipeline(tr[cols]).fit(tr[cols], tr[TARGET])
+        lasso_c = load_best_config(output_dir(project, clip=True), name)["lasso_C"]
+        final = build_pipeline(tr[cols], lasso_c=lasso_c).fit(tr[cols], tr[TARGET])
         for cohort, df in [("Training cohort", tr), ("Test cohort", te)]:
             y = df[TARGET].to_numpy()
             prob = final.predict_proba(df[cols])[:, 1]
