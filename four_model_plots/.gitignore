@@ -1,0 +1,23 @@
+# Local inputs and outputs are never part of the public release.
+private_data/
+demo_data/
+output/
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.npz
+*.npy
+*.joblib
+*.pkl
+*.pickle
+*.parquet
+*.zip
+*.pdf
+*.png
+.env
+.env.*
+.DS_Store
